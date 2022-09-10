@@ -5,7 +5,7 @@
 Utilities for sending files over ssh using the scp1 protocol.
 """
 
-__version__ = "0.14.2"
+__version__ = "0.14.4"
 
 import io
 import locale
@@ -14,15 +14,29 @@ import os
 import pathlib
 import re
 from socket import timeout as SocketTimeout
+from typing import IO, BinaryIO
+from typing import TYPE_CHECKING
+from typing import AnyStr
+from typing import Callable
+from typing import Iterable
+from typing import Optional
+from typing import Tuple
+from typing import Union
+# from typing import Self
+
+import paramiko.transport
+import paramiko.channel
 
 logger = logging.getLogger(__name__)
 
-# this is quote from the shlex module, added in py3.3
-_find_unsafe = re.compile(br"[^\w@%+=:,./~-]").search
-
 SCP_COMMAND = b"scp"
 
-PATH_TYPES = (str, bytes, pathlib.PurePath)
+PathTypes = Union[str, bytes, pathlib.PurePath]
+
+
+# this is quote from the shlex module, added in py3.3
+_find_unsafe = re.compile(rb"[^\w@%+=:,./~-]").search
+
 
 def _sh_quote(s):
     """Return a shell-escaped version of the string `s`."""
@@ -94,14 +108,27 @@ class SCPClient(object):
     (matching scp behaviour), but we make no attempt at symlinked directories.
     """
 
+    transport: paramiko.transport.Transport
+    buff_size: int
+    socket_timeout: float
+    channel: paramiko.channel.Channel | None
+    _progress: Callable[[bytes, int, int, tuple[str, int]], None] | None
+    _recv_dir: bytes
+    _depth: int
+    _utime: tuple[int, int] | None
+    _dirtimes: dict
+    peername: tuple[str, int]
+    scp_command: bytes
+    sanitize: Callable[[str], str]
+
     def __init__(
         self,
-        transport,
-        buff_size=16384,
-        socket_timeout=10.0,
-        progress=None,
-        progress4=None,
-        sanitize=_sh_quote,
+        transport: paramiko.transport.Transport,
+        buff_size: int = 16384,
+        socket_timeout: float = 10.0,
+        progress: Callable[[bytes, int, int], None] | None = None,
+        progress4: Callable[[bytes, int, int, tuple[str, int]], None] | None = None,
+        sanitize: Callable[[str], str] = _sh_quote,
     ):
         """
         Create an scp1 client.
@@ -149,7 +176,13 @@ class SCPClient(object):
     def __exit__(self, type, value, traceback):
         self.close()
 
-    def put(self, files, remote_path=b".", recursive=False, preserve_times=False):
+    def put(
+        self,
+        files: str | list[str],
+        remote_path: bytes = b".",
+        recursive: bool = False,
+        preserve_times: bool = False,
+    ):
         """
         Transfer files and directories to remote host.
 
@@ -173,7 +206,7 @@ class SCPClient(object):
         self.channel.exec_command(scp_command + self.sanitize(asbytes(remote_path)))
         self._recv_confirm()
 
-        if isinstance(files, PATH_TYPES):
+        if isinstance(files, PathTypes):
             files = [files]
         else:
             files = list(files)
@@ -185,7 +218,13 @@ class SCPClient(object):
 
         self.close()
 
-    def putfo(self, fl, remote_path, mode="0644", size=None):
+    def putfo(
+        self,
+        fl: BinaryIO,
+        remote_path: str,
+        mode: str = "0644",
+        size: int | None = None,
+    ):
         """
         Transfer file-like object to remote host.
 
@@ -206,19 +245,19 @@ class SCPClient(object):
 
         self.channel = self._open()
         self.channel.settimeout(self.socket_timeout)
-        self.channel.exec_command(
-            self.scp_command + b" -t " + self.sanitize(asbytes(remote_path))
-        )
+        command = self.scp_command + b" -v -t " + self.sanitize(asbytes(remote_path))
+        logger.debug(f"sending command {command!r}")
+        self.channel.exec_command(command)
         self._recv_confirm()
         self._send_file(fl, remote_path, mode, size=size)
         self.close()
 
     def getfo(
         self,
-        remote_path: PATH_TYPES,
-        recursive=False,
-        preserve_times=False,
-    ):
+        remote_path: PathTypes,
+        recursive: bool = False,
+        preserve_times: bool = False,
+    ) -> list[dict]:
         """
         Transfer files and directories from remote host to localhost.
 
@@ -234,7 +273,7 @@ class SCPClient(object):
             and directories.
         @type preserve_times: bool
         """
-        if isinstance(remote_path, PATH_TYPES):
+        if isinstance(remote_path, PathTypes):
             remote_path = [remote_path]
         else:
             remote_path = list(remote_path)
@@ -248,9 +287,8 @@ class SCPClient(object):
         self.channel = self._open()
         self._pushed = 0
         self.channel.settimeout(self.socket_timeout)
-        self.channel.exec_command(
-            self.scp_command + rcsv + prsv + b" -f " + b" ".join(remote_path)
-        )
+        command = self.scp_command + rcsv + prsv + b" -f " + b" ".join(remote_path)
+        self.channel.exec_command(command)
         self._recv_all()
         self.close()
         return self._files
@@ -268,12 +306,12 @@ class SCPClient(object):
             self.channel.close()
             self.channel = None
 
-    def _read_stats(self, name):
+    def _read_stats(self, name: PathTypes) -> tuple[str, int, int, int]:
         """return just the file stats needed for scp"""
         if os.name == "nt":
             name = asunicode(name)
         stats = os.stat(name)
-        mode = oct(stats.st_mode)[-4:]
+        mode = f"{stats.st_mode:04o}"
         size = stats.st_size
         atime = int(stats.st_atime)
         mtime = int(stats.st_mtime)
@@ -288,16 +326,15 @@ class SCPClient(object):
             self._send_file(fl, name, mode, size)
             fl.close()
 
-    def _send_file(self, fl, name, mode, size):
-        basename = asbytes(os.path.basename(name))
+    def _send_file(self, fl: BinaryIO, name: str, mode: str, size: int):
+        logger.info(f"send file {name} {mode} {size}")
+
         # The protocol can't handle \n in the filename.
         # Quote them as the control sequence \^J for now,
         # which is how openssh handles it.
-        self.channel.sendall(
-            ("C%s %d " % (mode, size)).encode("ascii")
-            + basename.replace(b"\n", b"\\^J")
-            + b"\n"
-        )
+        basename = os.path.basename(name).replace("\n", "\\^J")
+        command = f"C{mode} {size} {basename}\n".encode("ascii")
+        self.channel.sendall(command)
         self._recv_confirm()
         file_pos = 0
         if self._progress:
@@ -309,14 +346,15 @@ class SCPClient(object):
         buff_size = self.buff_size
         chan = self.channel
         while file_pos < size:
-            chan.sendall(fl.read(buff_size))
+            data = fl.read(buff_size)
+            chan.sendall(data)
             file_pos = fl.tell()
             if self._progress:
                 self._progress(basename, size, file_pos, self.peername)
-        chan.sendall("\x00")
+        chan.sendall(b"\x00")
         self._recv_confirm()
 
-    def _chdir(self, from_dir, to_dir):
+    def _chdir(self, from_dir: PathTypes, to_dir: PathTypes):
         # Pop until we're one level up from our next push.
         # Push *once* into to_dir.
         # This is dependent on the depth-first traversal from os.walk
@@ -334,7 +372,7 @@ class SCPClient(object):
         # now we're in our common base directory, so on
         self._send_pushd(to_dir)
 
-    def _send_recursive(self, files):
+    def _send_recursive(self, files: PathTypes):
         for base in files:
             base = asbytes(base)
             if not os.path.isdir(base):
@@ -351,37 +389,38 @@ class SCPClient(object):
             while self._pushed > 0:
                 self._send_popd()
 
-    def _send_pushd(self, directory):
+    def _send_pushd(self, directory: PathTypes):
         (mode, size, mtime, atime) = self._read_stats(directory)
         basename = asbytes(os.path.basename(directory))
+        basename = basename.replace(b"\n", b"\\^J")
         if self.preserve_times:
             self._send_time(mtime, atime)
         self.channel.sendall(
-            ("D%s 0 " % mode).encode("ascii") + basename.replace(b"\n", b"\\^J") + b"\n"
+            f"D{mode} 0 {basename}\n".encode("ascii")
         )
         self._recv_confirm()
         self._pushed += 1
 
     def _send_popd(self):
-        self.channel.sendall("E\n")
+        self.channel.sendall(b"E\n")
         self._recv_confirm()
         self._pushed -= 1
 
-    def _send_time(self, mtime, atime):
-        self.channel.sendall(("T%d 0 %d 0\n" % (mtime, atime)).encode("ascii"))
+    def _send_time(self, mtime: int, atime: int):
+        self.channel.sendall(f"T{mtime:d} 0 {atime:d} 0\n".encode("ascii"))
         self._recv_confirm()
 
     def _recv_confirm(self):
         # read scp response
         msg = b""
         try:
-            msg = self.channel.recv(512)
+            msg = self.channel.recv(1)
         except SocketTimeout:
             raise SCPException("Timeout waiting for scp response")
         # slice off the first byte, so this compare will work in py2 and py3
-        if msg and msg[0:1] == b"\x00":
+        if msg == b"\x00":
             return
-        elif msg and msg[0:1] == b"\x01":
+        elif msg == b"\x01":
             raise SCPException(asunicode(msg[1:]))
         elif self.channel.recv_stderr_ready():
             msg = self.channel.recv_stderr(512)
@@ -401,7 +440,7 @@ class SCPClient(object):
         }
         while not self.channel.closed:
             # wait for command as long as we're open
-            self.channel.sendall("\x00")
+            self.channel.sendall(b"\x00")
             msg = self.channel.recv(1024)
             if not msg:  # chan closed while receiving
                 break
@@ -424,6 +463,7 @@ class SCPClient(object):
         self._utime = (atime, mtime)
 
     def _recv_file(self, cmd):
+        logger.debug(f"recv file {cmd!r}")
         chan = self.channel
         parts = cmd.strip().split(b" ", 2)
 
@@ -433,7 +473,7 @@ class SCPClient(object):
             name = parts[2]
             path = os.path.join(asbytes(self._recv_dir), name)
         except:
-            chan.send("\x01")
+            chan.send(b"\x01")
             chan.close()
             raise SCPException("Bad file format")
 
@@ -512,51 +552,3 @@ class SCPException(Exception):
     """SCP exception class"""
 
     pass
-
-
-def put(transport, files, remote_path=b".", recursive=False, preserve_times=False):
-    """
-    Transfer files and directories to remote host.
-
-    This is a convenience function that creates a SCPClient from the given
-    transport and closes it at the end, useful for one-off transfers.
-
-    @param files: A single path, or a list of paths to be transferred.
-        recursive must be True to transfer directories.
-    @type files: string OR list of strings
-    @param remote_path: path in which to receive the files on the remote host.
-        defaults to '.'
-    @type remote_path: str
-    @param recursive: transfer files and directories recursively
-    @type recursive: bool
-    @param preserve_times: preserve mtime and atime of transferred files and
-        directories.
-    @type preserve_times: bool
-    """
-    with SCPClient(transport) as client:
-        client.put(files, remote_path, recursive, preserve_times)
-
-
-def get(transport, remote_path, local_path="", recursive=False, preserve_times=False):
-    """
-    Transfer files and directories from remote host to localhost.
-
-    This is a convenience function that creates a SCPClient from the given
-    transport and closes it at the end, useful for one-off transfers.
-
-    @param transport: an paramiko L{Transport}
-    @type transport: L{Transport}
-    @param remote_path: path to retrieve from remote host. since this is
-        evaluated by scp on the remote host, shell wildcards and environment
-        variables may be used.
-    @type remote_path: str
-    @param local_path: path in which to receive files locally
-    @type local_path: str
-    @param recursive: transfer files and directories recursively
-    @type recursive: bool
-    @param preserve_times: preserve mtime and atime of transferred files
-        and directories.
-    @type preserve_times: bool
-    """
-    with SCPClient(transport) as client:
-        client.get(remote_path, local_path, recursive, preserve_times)
